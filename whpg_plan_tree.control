@@ -1,0 +1,3 @@
+comment = 'Real, kernel-captured query plan tree for live monitoring -- built for WHPG, also runs across GPDB-lineage cores from PG12 through PG19'
+default_version = '1.0.0'
+relocatable = true

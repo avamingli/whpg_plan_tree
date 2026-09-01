@@ -1,0 +1,75 @@
+-- whpg_plan_tree regression test
+--
+-- Precondition (same as manual use): the target cluster must already have
+-- gp_enable_query_metrics = on and whpg_plan_tree in shared_preload_libraries
+-- (both PGC_POSTMASTER, set before the server this test runs against was
+-- started). This test asserts real captured rows exist, so it fails loudly
+-- -- not silently -- if that precondition isn't met.
+--
+-- Deliberately does not diff exact plan-shape output: tmid/ssid/ccnt/pid
+-- are different every run by design, and startup_cost/total_cost/plan_rows
+-- can legitimately vary by planner (native vs. GPORCA) or by whichever
+-- table statistics happen to be in place -- none of which is what this
+-- extension itself is responsible for getting right.
+--
+-- Also deliberately does NOT assert cross-row tree-shape invariants (e.g.
+-- "every parent_nid resolves to a captured node") against arbitrary rows
+-- in plan_tree_detail: (tmid, ssid, ccnt, segid) is only unique among
+-- *concurrently live* captures, not forever -- on a long-lived cluster
+-- that has cycled through many sessions, an old, already-fully-recycled
+-- capture's key can coincide with a new one (confirmed live: a
+-- heavily-reused dev cluster reliably reproduced exactly this).
+-- The real consumer (pg_dash) never hits this in practice because it only
+-- ever looks at a session it has just verified is *still actively running
+-- that exact query* (SessIDForPidRunning) -- a live check close in time,
+-- not an arbitrary historical scan. A regression test re-running against
+-- the same long-lived cluster over and over is a much more adversarial
+-- case than that, and isn't what this extension's own correctness
+-- contract is about.
+--
+-- The target query below runs as the very first statement in this
+-- session, deliberately before CREATE EXTENSION/\d/anything else -- every
+-- one of those is itself a real SELECT under the hood (yes, even \d's
+-- catalog lookup) and gets captured too, same as any other query. The
+-- check below filters to min(ccnt) for this session, i.e. the earliest
+-- capture, which is this first statement precisely because nothing ran
+-- before it in this fresh connection.
+
+SELECT count(*) FROM generate_series(1, 1000);
+
+SELECT sess_id AS own_ssid FROM pg_stat_activity WHERE pid = pg_backend_pid() \gset
+
+CREATE EXTENSION whpg_plan_tree;
+
+-- Object shape: the extension's own script created these.
+\d plan_tree.plan_tree_detail
+
+-- Precondition check: fail loudly, not silently, if nothing was captured
+-- (most likely cause: gp_enable_query_metrics/shared_preload_libraries not
+-- set on this cluster -- see the precondition note above).
+SELECT count(*) > 0 AS captured_something
+FROM plan_tree.plan_tree_detail
+WHERE ssid = :own_ssid
+  AND ccnt = (SELECT min(ccnt) FROM plan_tree.plan_tree_detail WHERE ssid = :own_ssid);
+
+-- The coordinator's own capture (segid = -1) is written by a single,
+-- uninterrupted walk of its own local plan tree in CapturePlanTree() --
+-- unlike a cross-segid scan, this one slot's own internal consistency
+-- held up reliably across repeated live runs. Exactly one root.
+SELECT count(*) = 1 AS exactly_one_coordinator_root
+FROM plan_tree.plan_tree_detail
+WHERE ssid = :own_ssid
+  AND ccnt = (SELECT min(ccnt) FROM plan_tree.plan_tree_detail WHERE ssid = :own_ssid)
+  AND segid = -1
+  AND parent_nid = -1;
+
+-- node_type is always resolved to a real label, never blank (a blank would
+-- mean PlanTreeNodeTypeName()/MotionTypeName() fell through to "???" for a
+-- NodeTag this module doesn't know about -- see the portability comment at
+-- the top of whpg_plan_tree.c for how known gaps are handled).
+SELECT bool_and(node_type IS NOT NULL AND node_type <> '') AS every_node_has_a_label
+FROM plan_tree.plan_tree_detail
+WHERE ssid = :own_ssid
+  AND ccnt = (SELECT min(ccnt) FROM plan_tree.plan_tree_detail WHERE ssid = :own_ssid);
+
+DROP EXTENSION whpg_plan_tree;

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- whpg_plan_tree: a live-captured plan tree — node boxes and colors match
+       the pg_dash Watch rendering of plan_tree.plan_tree_detail -->
+  <rect width="128" height="128" rx="28" fill="#0A0F0C"/>
+  <!-- edges -->
+  <path d="M64 50 C64 64 35 60 35 74" fill="none" stroke="#2E5D4B" stroke-width="3"/>
+  <path d="M64 50 C64 64 93 60 93 74" fill="none" stroke="#2E5D4B" stroke-width="3"/>
+  <!-- root node -->
+  <rect x="38" y="26" width="52" height="24" rx="7" fill="#132A20" stroke="#3ECF8E" stroke-width="3"/>
+  <circle cx="48" cy="38" r="3" fill="#3ECF8E"/>
+  <rect x="55" y="35.5" width="24" height="5" rx="2.5" fill="#2E7D5B"/>
+  <!-- child nodes -->
+  <rect x="12" y="74" width="46" height="22" rx="7" fill="#10231B" stroke="#2E9E70" stroke-width="3"/>
+  <circle cx="21" cy="85" r="2.5" fill="#3ECF8E"/>
+  <rect x="27" y="82.5" width="20" height="5" rx="2.5" fill="#26654C"/>
+  <rect x="70" y="74" width="46" height="22" rx="7" fill="#10231B" stroke="#2E9E70" stroke-width="3"/>
+  <circle cx="79" cy="85" r="2.5" fill="#3ECF8E"/>
+  <rect x="85" y="82.5" width="20" height="5" rx="2.5" fill="#26654C"/>
+  <!-- live pulse on the root -->
+  <circle cx="90" cy="26" r="9" fill="#3ECF8E" opacity="0.25"/>
+  <circle cx="90" cy="26" r="4.5" fill="#4AE3A0"/>
+</svg>

@@ -1,0 +1,7 @@
+*.o
+*.so
+*.bc
+/results/
+/regression.diffs
+/regression.out
+/log/
