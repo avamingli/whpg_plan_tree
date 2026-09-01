@@ -185,6 +185,13 @@ typedef struct PlanTreeNodeEntry
 
 typedef struct PlanTreeSlot
 {
+	uint32		magic;			/* PLAN_TREE_MAGIC_FREE while on the free
+								 * list (natural result of PATTERN-fill),
+								 * 0 in the transient "allocated, being
+								 * populated" window, PLAN_TREE_MAGIC_VALID
+								 * once the capture is complete. Readers
+								 * observe only VALID slots, so a torn or
+								 * error-aborted populate is invisible. */
 	int32		pid;
 	int32		tmid;
 	int32		ssid;
@@ -226,10 +233,28 @@ typedef struct PlanTreeResownerSet
  * GetInstrumentNext: a free slot is PATTERN-filled, and its last 8 bytes
  * (the last node entry's plan_rows, a full double) double as the "next
  * free slot" pointer while unused.
+ *
+ * "Is this slot free?" is checked via slot->magic == PLAN_TREE_MAGIC_FREE
+ * rather than "the first 8 bytes are all pattern": magic is only ever
+ * assigned one of three specific values, so there is no way for a real
+ * capture's header bytes (pid/tmid) to accidentally collide with the
+ * pattern -- eliminating the tiny theoretical false-positive InstrumentSlot
+ * inherits from its raw-pattern check.
+ *
+ * "Is this slot safe for a reader to consume?" is a stricter check, since a
+ * slot can also be transiently in the ALLOC state (magic == 0 after
+ * memset(0), before the writer publishes) -- readers filter on
+ * magic == PLAN_TREE_MAGIC_VALID.
  */
 #define PLAN_TREE_PATTERN 0xd5
-#define PLAN_TREE_LONG_PATTERN 0xd5d5d5d5d5d5d5d5
-#define PlanTreeSlotIsEmpty(slot) ((*((int64 *)(slot)) ^ PLAN_TREE_LONG_PATTERN) == 0)
+#define PLAN_TREE_MAGIC_FREE  0xd5d5d5d5U		/* what PATTERN-fill leaves
+												 * in .magic; unreachable
+												 * from any live capture */
+#define PLAN_TREE_MAGIC_VALID 0xc0de1234U		/* final "publish" store
+												 * done under LW_EXCLUSIVE
+												 * after populate -- readers
+												 * key on this */
+#define PlanTreeSlotIsEmpty(slot) ((slot)->magic == PLAN_TREE_MAGIC_FREE)
 #define GetPlanTreeNext(slot) (*((PlanTreeSlot **)((slot) + 1) - 1))
 
 typedef struct PlanCaptureContext
@@ -615,24 +640,26 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 
 				switch (agg->aggstrategy)
 				{
-					case AGG_PLAIN: strcpy(entry->strategy, "Plain"); break;
-					case AGG_SORTED: strcpy(entry->strategy, "Sorted"); break;
-					case AGG_HASHED: strcpy(entry->strategy, "Hashed"); break;
-					case AGG_MIXED: strcpy(entry->strategy, "Mixed"); break;
+					case AGG_PLAIN: strlcpy(entry->strategy, "Plain", sizeof(entry->strategy)); break;
+					case AGG_SORTED: strlcpy(entry->strategy, "Sorted", sizeof(entry->strategy)); break;
+					case AGG_HASHED: strlcpy(entry->strategy, "Hashed", sizeof(entry->strategy)); break;
+					case AGG_MIXED: strlcpy(entry->strategy, "Mixed", sizeof(entry->strategy)); break;
 				}
 				if (DO_AGGSPLIT_SKIPFINAL(agg->aggsplit))
-					strcpy(entry->partial_mode, "Partial");
+					strlcpy(entry->partial_mode, "Partial", sizeof(entry->partial_mode));
 				else if (DO_AGGSPLIT_COMBINE(agg->aggsplit))
-					strcpy(entry->partial_mode, "Finalize");
+					strlcpy(entry->partial_mode, "Finalize", sizeof(entry->partial_mode));
 				else
-					strcpy(entry->partial_mode, "Simple");
+					strlcpy(entry->partial_mode, "Simple", sizeof(entry->partial_mode));
 				break;
 			}
 		case T_SetOp:
 			{
 				SetOp	   *setop = (SetOp *) plan;
 
-				strcpy(entry->strategy, setop->strategy == SETOP_HASHED ? "Hashed" : "Sorted");
+				strlcpy(entry->strategy,
+						setop->strategy == SETOP_HASHED ? "Hashed" : "Sorted",
+						sizeof(entry->strategy));
 				break;
 			}
 		case T_ModifyTable:
@@ -641,9 +668,9 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 
 				switch (mt->operation)
 				{
-					case CMD_INSERT: strcpy(entry->operation, "Insert"); break;
-					case CMD_UPDATE: strcpy(entry->operation, "Update"); break;
-					case CMD_DELETE: strcpy(entry->operation, "Delete"); break;
+					case CMD_INSERT: strlcpy(entry->operation, "Insert", sizeof(entry->operation)); break;
+					case CMD_UPDATE: strlcpy(entry->operation, "Update", sizeof(entry->operation)); break;
+					case CMD_DELETE: strlcpy(entry->operation, "Delete", sizeof(entry->operation)); break;
 					default: break;
 				}
 				break;
@@ -655,10 +682,10 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 
 				switch (fs->operation)
 				{
-					case CMD_SELECT: strcpy(entry->operation, "Select"); break;
-					case CMD_INSERT: strcpy(entry->operation, "Insert"); break;
-					case CMD_UPDATE: strcpy(entry->operation, "Update"); break;
-					case CMD_DELETE: strcpy(entry->operation, "Delete"); break;
+					case CMD_SELECT: strlcpy(entry->operation, "Select", sizeof(entry->operation)); break;
+					case CMD_INSERT: strlcpy(entry->operation, "Insert", sizeof(entry->operation)); break;
+					case CMD_UPDATE: strlcpy(entry->operation, "Update", sizeof(entry->operation)); break;
+					case CMD_DELETE: strlcpy(entry->operation, "Delete", sizeof(entry->operation)); break;
 					default: break;
 				}
 				break;
@@ -767,6 +794,38 @@ plan_capture_walker(PlanState *planstate, void *context)
  * CdbDispatchPlan. QE backends reach the same call site independently via
  * exec_mpp_query's standard PortalStart/ExecutorStart path, with their
  * own local copy of the same plan_node_id-numbered tree.
+ *
+ * Concurrency contract:
+ *   - LW_EXCLUSIVE is held only across two short critical sections: the
+ *     free-list pop, and a single-store publish at the end. The plan-tree
+ *     walk (bounded to WHPG_PLAN_TREE_MAX_NODES=128, plus a syscache
+ *     lookup per scan for the relname) runs *lock-free* between them --
+ *     so every backend's METRICS_PLAN_NODE_INITIALIZE does not serialize
+ *     on this one cluster-wide lock. This matters: every query on the
+ *     cluster hits this path.
+ *   - Ownership discipline replaces continuous locking: a popped slot is
+ *     exclusively owned by this backend from pop until either publish or
+ *     resowner-recycle; no other backend can touch it because it's off
+ *     the free list. So the lock-free populate is race-free on its own
+ *     terms (nobody else writes this slot), and readers that iterate the
+ *     whole slot array simply skip it via the magic filter.
+ *   - slot->magic starts at PLAN_TREE_MAGIC_FREE (on the free list),
+ *     transitions to 0 the instant we memset(0) the slot, and is finally
+ *     set to PLAN_TREE_MAGIC_VALID inside the second LWLock section as
+ *     the sole publish store. The LWLockAcquire before it is a full
+ *     memory barrier, so all the lock-free populate stores above
+ *     happen-before the magic store; a reader that later takes LW_SHARED
+ *     and observes magic == VALID is guaranteed to see the fully-
+ *     populated slot. Readers filter on magic == VALID and skip any
+ *     other state -- so a slot that's mid-populate (magic == 0) or that
+ *     aborted before publish is invisible until the resowner callback
+ *     returns it to the free list.
+ *   - The resowner tracking entry is registered *before* the walk begins:
+ *     if the walk throws, PG's abort processing runs the
+ *     RESOURCE_RELEASE_AFTER_LOCKS callback, which recycles the slot
+ *     back to the free list. Without this ordering a throwing walk would
+ *     permanently leak the slot. planSlotsOccupied is backend-local, so
+ *     the linked-list splice needs no lock.
  */
 static void
 CapturePlanTree(QueryDesc *queryDesc)
@@ -794,8 +853,20 @@ CapturePlanTree(QueryDesc *queryDesc)
 	if (queryDesc == NULL || queryDesc->planstate == NULL)
 		return;
 
-	LWLockAcquire(PLAN_TREE_LOCK, LW_EXCLUSIVE);
+	/*
+	 * Pre-allocate the resowner tracking entry outside the LWLock so an
+	 * ENOMEM here (backend-local, no shmem touched) is a clean no-op
+	 * rather than a shmem slot orphaned off the free list.
+	 */
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	item = (PlanTreeResownerSet *) palloc0(sizeof(PlanTreeResownerSet));
+	MemoryContextSwitchTo(oldcontext);
 
+	/*
+	 * Section 1: pop a free slot under LW_EXCLUSIVE, then release. Held
+	 * only across the linked-list unlink and counter decrement.
+	 */
+	LWLockAcquire(PLAN_TREE_LOCK, LW_EXCLUSIVE);
 	slot = PlanTreeGlobal->head;
 	if (NULL != slot && PlanTreeSlotIsEmpty(slot))
 	{
@@ -804,12 +875,20 @@ CapturePlanTree(QueryDesc *queryDesc)
 	}
 	else
 		slot = NULL;
-
 	LWLockRelease(PLAN_TREE_LOCK);
 
 	if (slot == NULL)
+	{
+		pfree(item);
 		return;					/* no free slot; skip capture, degrade gracefully */
+	}
 
+	/*
+	 * Lock-free populate. This slot is off the free list, so no other
+	 * backend can touch it. memset(0) leaves magic == 0 (neither FREE
+	 * nor VALID), which readers filter out -- so an in-flight populate
+	 * is invisible to concurrent readers.
+	 */
 	memset(slot, 0x00, sizeof(PlanTreeSlot));
 	slot->segid = (int16) GpIdentity.segindex;
 	slot->pid = MyProcPid;
@@ -819,18 +898,33 @@ CapturePlanTree(QueryDesc *queryDesc)
 	slot->nnodes = 0;
 	slot->truncated = false;
 
-	ctx.slot = slot;
-	ctx.parent_nid = -1;
-	capture_one_node(queryDesc->planstate, &ctx);
-
-	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-
-	item = (PlanTreeResownerSet *) palloc0(sizeof(PlanTreeResownerSet));
+	/*
+	 * Register with the current ResourceOwner *before* walking so an
+	 * ereport() out of fill_node_extras' get_rel_name lookup (unlikely at
+	 * this point but not statically excluded) still gets the slot back to
+	 * the free list at abort -- see the function header comment.
+	 * planSlotsOccupied is backend-local, no shmem lock needed.
+	 */
 	item->owner = CurrentResourceOwner;
 	item->slot = slot;
 	item->next = planSlotsOccupied;
 	planSlotsOccupied = item;
-	MemoryContextSwitchTo(oldcontext);
+
+	ctx.slot = slot;
+	ctx.parent_nid = -1;
+	capture_one_node(queryDesc->planstate, &ctx);
+
+	/*
+	 * Section 2: publish under LW_EXCLUSIVE, held only across a single
+	 * store. The lock acquire is a full memory barrier, so the lock-free
+	 * populate stores above are visible before magic = VALID; any reader
+	 * that later takes LW_SHARED and sees magic == VALID observes the
+	 * fully-populated slot. Contention here is negligible -- a single
+	 * store's worth of hold time, no cross-backend gating on the walk.
+	 */
+	LWLockAcquire(PLAN_TREE_LOCK, LW_EXCLUSIVE);
+	slot->magic = PLAN_TREE_MAGIC_VALID;
+	LWLockRelease(PLAN_TREE_LOCK);
 }
 
 /*
@@ -897,46 +991,46 @@ plan_tree_query_info_hook(QueryMetricsStatus status, void *args)
 
 typedef struct PlanTreeDetailCtx
 {
+	int32		nSlots;			/* # populated slots in the local snapshot */
 	int32		slotIndex;
 	int32		nodeIndex;
+	PlanTreeSlot *slots;		/* backend-local snapshot taken once at
+								 * SRF first-call, under LW_SHARED; every
+								 * per-call iteration below then touches
+								 * only this local array. Two reasons:
+								 * (1) SRF calls can be paused arbitrarily
+								 * by the consumer, so holding the shmem
+								 * lock across them would gate every
+								 * writer on a slow SELECT; (2) reading a
+								 * slot lock-free while another backend's
+								 * recycle memset(PATTERN)s it would tear
+								 * -- e.g. relname without a NUL, causing
+								 * CStringGetTextDatum's strlen to overrun. */
 } PlanTreeDetailCtx;
 
 /*
- * Advance to the next (slot, node) pair, skipping empty/free slots.
- * Returns false once every occupied slot's nodes have been emitted.
+ * Advance to the next (slot, node) pair in the backend-local snapshot.
+ * The snapshot was materialized under LW_SHARED in SRF first-call, so
+ * this walks only local memory -- no lock, no shmem access, no torn read.
  */
 static bool
 next_plan_tree_slot_node(PlanTreeDetailCtx *ctx, PlanTreeSlot **outSlot, PlanTreeNodeEntry **outEntry)
 {
-	if (PlanTreeGlobal == NULL)
-		return false;
-
-	for (;;)
+	while (ctx->slotIndex < ctx->nSlots)
 	{
-		if (ctx->slotIndex >= (int32) PlanTreeNumSlots())
-			return false;
+		PlanTreeSlot *slot = &ctx->slots[ctx->slotIndex];
 
-		PlanTreeSlot *slot = GET_PLAN_TREE_SLOT_BY_INDEX(ctx->slotIndex);
-
-		if (PlanTreeSlotIsEmpty(slot))
+		if (ctx->nodeIndex < slot->nnodes)
 		{
-			ctx->slotIndex++;
-			ctx->nodeIndex = 0;
-			continue;
+			*outSlot = slot;
+			*outEntry = &slot->nodes[ctx->nodeIndex];
+			ctx->nodeIndex++;
+			return true;
 		}
-
-		if (ctx->nodeIndex >= slot->nnodes)
-		{
-			ctx->slotIndex++;
-			ctx->nodeIndex = 0;
-			continue;
-		}
-
-		*outSlot = slot;
-		*outEntry = &slot->nodes[ctx->nodeIndex];
-		ctx->nodeIndex++;
-		return true;
+		ctx->slotIndex++;
+		ctx->nodeIndex = 0;
 	}
+	return false;
 }
 
 Datum		plan_tree_detail(PG_FUNCTION_ARGS);
@@ -955,7 +1049,7 @@ PG_FUNCTION_INFO_V1(plan_tree_detail);
  *   				,relname text, plan_rows float8
  *   				,startup_cost float8, total_cost float8, plan_width int4
  *                 )
- *   AS '$libdir/whpg_plan_tree', 'plan_tree_detail' LANGUAGE C IMMUTABLE;
+ *   AS '$libdir/whpg_plan_tree', 'plan_tree_detail' LANGUAGE C VOLATILE;
  */
 Datum
 plan_tree_detail(PG_FUNCTION_ARGS)
@@ -1003,6 +1097,44 @@ plan_tree_detail(PG_FUNCTION_ARGS)
 
 		ctx = (PlanTreeDetailCtx *) palloc0(sizeof(PlanTreeDetailCtx));
 		funcctx->user_fctx = ctx;
+
+		/*
+		 * Snapshot every published (magic == VALID) slot under LW_SHARED,
+		 * then release the lock. Per-call iteration below reads the local
+		 * copy only. Sized by PlanTreeGlobal->free (read under the same
+		 * lock) so we never over-palloc, and defensive-bounded by
+		 * ctx->nSlots < maxSnap in case a race between free-counter and
+		 * per-slot magic happens to have transient slack.
+		 */
+		if (PlanTreeGlobal != NULL)
+		{
+			int32		nSlotsTotal;
+			int32		maxSnap;
+
+			LWLockAcquire(PLAN_TREE_LOCK, LW_SHARED);
+
+			nSlotsTotal = (int32) PlanTreeNumSlots();
+			maxSnap = nSlotsTotal - PlanTreeGlobal->free;
+
+			if (maxSnap > 0)
+			{
+				int32	i;
+
+				ctx->slots = (PlanTreeSlot *) palloc(maxSnap * sizeof(PlanTreeSlot));
+
+				for (i = 0; i < nSlotsTotal && ctx->nSlots < maxSnap; i++)
+				{
+					PlanTreeSlot *src = GET_PLAN_TREE_SLOT_BY_INDEX(i);
+
+					if (src->magic != PLAN_TREE_MAGIC_VALID)
+						continue;
+					memcpy(&ctx->slots[ctx->nSlots++], src, sizeof(PlanTreeSlot));
+				}
+			}
+
+			LWLockRelease(PLAN_TREE_LOCK);
+		}
+
 		MemoryContextSwitchTo(oldcontext);
 	}
 
@@ -1142,4 +1274,20 @@ void
 _PG_fini(void)
 {
 	query_info_collect_hook = prev_query_info_collect_hook;
+
+#if !WHPG_PLAN_TREE_NEW_CALLBACKS
+	shmem_startup_hook = prev_shmem_startup_hook;
+#if PG_VERSION_NUM >= 150000
+	shmem_request_hook = prev_shmem_request_hook;
+#endif
+#endif
+
+	/*
+	 * No public API exists to unregister a RegisterShmemCallbacks entry
+	 * or a RegisterResourceReleaseCallback entry; those stay wired for
+	 * the process lifetime. Not observable in practice: a
+	 * shared_preload_libraries module is never actually unloaded from a
+	 * running postmaster -- _PG_fini is a formality here, kept only so
+	 * the hooks we *can* restore are restored symmetrically.
+	 */
 }
