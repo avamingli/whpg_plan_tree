@@ -188,12 +188,15 @@ typedef struct PlanTreeNodeEntry
 typedef struct PlanTreeSlot
 {
 	uint32		magic;			/* PLAN_TREE_MAGIC_FREE while on the free
-								 * list (natural result of PATTERN-fill),
-								 * 0 in the transient "allocated, being
-								 * populated" window, PLAN_TREE_MAGIC_VALID
-								 * once the capture is complete. Readers
-								 * observe only VALID slots, so a torn or
-								 * error-aborted populate is invisible. */
+								 * list (natural result of PATTERN-fill,
+								 * also what the recycle callback sets),
+								 * stays FREE through the "allocated, being
+								 * populated" window (writer skips memset to
+								 * avoid a per-query 20KB store), then flips
+								 * to PLAN_TREE_MAGIC_VALID under LW_EXCLUSIVE
+								 * as the publish barrier. Readers observe
+								 * only VALID slots, so a mid-populate or
+								 * error-aborted slot is invisible. */
 	int32		pid;
 	int32		tmid;
 	int32		ssid;
@@ -243,10 +246,11 @@ typedef struct PlanTreeResownerSet
  * pattern -- eliminating the tiny theoretical false-positive InstrumentSlot
  * inherits from its raw-pattern check.
  *
- * "Is this slot safe for a reader to consume?" is a stricter check, since a
- * slot can also be transiently in the ALLOC state (magic == 0 after
- * memset(0), before the writer publishes) -- readers filter on
- * magic == PLAN_TREE_MAGIC_VALID.
+ * "Is this slot safe for a reader to consume?" is a stricter check --
+ * readers filter on magic == PLAN_TREE_MAGIC_VALID. A slot in the
+ * transient "popped from freelist, being populated" state still has
+ * magic == FREE (the writer doesn't clear it until publish), which the
+ * VALID-only filter naturally excludes.
  */
 #define PLAN_TREE_PATTERN 0xd5
 #define PLAN_TREE_MAGIC_FREE  0xd5d5d5d5U		/* what PATTERN-fill leaves
@@ -811,17 +815,18 @@ plan_capture_walker(PlanState *planstate, void *context)
  *     the free list. So the lock-free populate is race-free on its own
  *     terms (nobody else writes this slot), and readers that iterate the
  *     whole slot array simply skip it via the magic filter.
- *   - slot->magic starts at PLAN_TREE_MAGIC_FREE (on the free list),
- *     transitions to 0 the instant we memset(0) the slot, and is finally
- *     set to PLAN_TREE_MAGIC_VALID inside the second LWLock section as
- *     the sole publish store. The LWLockAcquire before it is a full
- *     memory barrier, so all the lock-free populate stores above
- *     happen-before the magic store; a reader that later takes LW_SHARED
- *     and observes magic == VALID is guaranteed to see the fully-
- *     populated slot. Readers filter on magic == VALID and skip any
- *     other state -- so a slot that's mid-populate (magic == 0) or that
- *     aborted before publish is invisible until the resowner callback
- *     returns it to the free list.
+ *   - slot->magic starts at PLAN_TREE_MAGIC_FREE (on the free list,
+ *     tagged by the recycle callback) and stays FREE throughout the
+ *     lock-free populate -- the writer deliberately does not clear the
+ *     slot to zero, saving a 20KB memset per capture. It flips to
+ *     PLAN_TREE_MAGIC_VALID inside the second LWLock section as the
+ *     sole publish store. The LWLockAcquire before it is a full memory
+ *     barrier, so all the lock-free populate stores above happen-before
+ *     the magic store; a reader that later takes LW_SHARED and observes
+ *     magic == VALID is guaranteed to see the fully-populated slot.
+ *     Readers filter on magic == VALID and skip anything else -- so a
+ *     slot mid-populate (still FREE) or an aborted populate (still
+ *     FREE, then recycled) is invisible.
  *   - The resowner tracking entry is registered *before* the walk begins:
  *     if the walk throws, PG's abort processing runs the
  *     RESOURCE_RELEASE_AFTER_LOCKS callback, which recycles the slot
@@ -887,11 +892,17 @@ CapturePlanTree(QueryDesc *queryDesc)
 
 	/*
 	 * Lock-free populate. This slot is off the free list, so no other
-	 * backend can touch it. memset(0) leaves magic == 0 (neither FREE
-	 * nor VALID), which readers filter out -- so an in-flight populate
-	 * is invisible to concurrent readers.
+	 * backend can touch it. magic stays at PLAN_TREE_MAGIC_FREE (untouched
+	 * from the recycle callback's cheap FREE tag) throughout populate;
+	 * readers filter on magic == VALID and skip anything else, so an
+	 * in-flight populate is invisible.
+	 *
+	 * Deliberately no memset of the slot: capture_one_node writes every
+	 * field of each PlanTreeNodeEntry it fills (fill_node_extras zeros the
+	 * conditional extras up front -- see its own head), and entries at
+	 * indices >= nnodes are never read by any consumer. A 20KB per-query
+	 * memset would add up under load for no observable benefit.
 	 */
-	memset(slot, 0x00, sizeof(PlanTreeSlot));
 	slot->segid = (int16) GpIdentity.segindex;
 	slot->pid = MyProcPid;
 	gp_gettmid(&(slot->tmid));
@@ -936,42 +947,74 @@ CapturePlanTree(QueryDesc *queryDesc)
  * (RESOURCE_RELEASE_AFTER_LOCKS) -- no separate/longer lifecycle for the
  * plan capture, on purpose (this is a monitoring aid, not history; a
  * finished query's slot should free up for the next one promptly).
+ *
+ * Two-phase, keep LW_EXCLUSIVE hold time to O(N) tiny stores:
+ *   1. Partition planSlotsOccupied into "expiring here" (matches current
+ *      resowner) and "still live" (belongs to an outer scope). Backend-local
+ *      linked-list splicing, no lock.
+ *   2. Under LW_EXCLUSIVE, per expiring slot: flip magic to FREE, splice
+ *      into shmem freelist, bump counter. No memset -- setting magic makes
+ *      the slot invisible to readers (they filter on magic == VALID), and
+ *      any stale bytes in nodes[] are never observed because the next
+ *      populate re-writes every entry up to its own nnodes and readers
+ *      only look at [0..nnodes-1]. A 20KB per-recycle memset under the
+ *      cluster-wide lock was serialising every query end unnecessarily.
+ *   3. Free the backend-local tracking items after releasing the lock.
  */
 static void
 planTreeRecycleCallback(ResourceReleasePhase phase, bool isCommit, bool isTopLevel, void *arg)
 {
 	PlanTreeResownerSet *next;
 	PlanTreeResownerSet *curr;
+	PlanTreeResownerSet *toRecycle = NULL;
+	PlanTreeResownerSet *kept = NULL;
 	PlanTreeSlot *slot;
 
 	if (NULL == PlanTreeGlobal || NULL == planSlotsOccupied || phase != RESOURCE_RELEASE_AFTER_LOCKS)
 		return;
 
+	/* Phase 1: lock-free partition. */
 	next = planSlotsOccupied;
 	planSlotsOccupied = NULL;
-	LWLockAcquire(PLAN_TREE_LOCK, LW_EXCLUSIVE);
 	while (next)
 	{
 		curr = next;
 		next = curr->next;
-		if (curr->owner != CurrentResourceOwner)
+		if (curr->owner == CurrentResourceOwner)
 		{
-			curr->next = planSlotsOccupied;
-			planSlotsOccupied = curr;
-			continue;
+			curr->next = toRecycle;
+			toRecycle = curr;
 		}
+		else
+		{
+			curr->next = kept;
+			kept = curr;
+		}
+	}
+	planSlotsOccupied = kept;
 
+	if (toRecycle == NULL)
+		return;
+
+	/* Phase 2: brief lock hold, per-slot O(2 stores). */
+	LWLockAcquire(PLAN_TREE_LOCK, LW_EXCLUSIVE);
+	for (curr = toRecycle; curr != NULL; curr = curr->next)
+	{
 		slot = curr->slot;
-
-		memset(slot, PLAN_TREE_PATTERN, sizeof(PlanTreeSlot));
-
+		slot->magic = PLAN_TREE_MAGIC_FREE;
 		GetPlanTreeNext(slot) = PlanTreeGlobal->head;
 		PlanTreeGlobal->head = slot;
 		PlanTreeGlobal->free++;
-
-		pfree(curr);
 	}
 	LWLockRelease(PLAN_TREE_LOCK);
+
+	/* Phase 3: free tracking items outside the lock. */
+	while (toRecycle)
+	{
+		curr = toRecycle;
+		toRecycle = curr->next;
+		pfree(curr);
+	}
 }
 
 /*
