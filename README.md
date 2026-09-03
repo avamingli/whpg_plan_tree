@@ -3,10 +3,10 @@
 A standalone extension for WarehousePG (WHPG) -- and, unmodified, for
 other GPDB-lineage databases, Greenplum itself included -- that captures
 the *real*, already-planned plan tree of every running query into shared
-memory and exposes it over SQL as `plan_tree.plan_tree_detail`. Nothing
+memory and exposes it over SQL as `whpg_plan_tree.plan_detail`. Nothing
 to patch and no core changes on any server: just install this extension.
 
-![A running query's real plan tree rendered live from plan_tree.plan_tree_detail](img/live_query_plan.png)
+![A running query's real plan tree rendered live from whpg_plan_tree.plan_detail](img/live_query_plan.png)
 
 *A running query, live: the node labels and tree shape come straight from
 the captured plan (not an `EXPLAIN` reconstruction), joined with the
@@ -43,13 +43,34 @@ Then, one-time on that server (needs a restart for the GUC/hook to take):
 ```sql
 -- gpconfig -c shared_preload_libraries -v whpg_plan_tree && gpstop -raf
 CREATE EXTENSION whpg_plan_tree;
-SELECT * FROM plan_tree.plan_tree_detail;
+SELECT * FROM whpg_plan_tree.plan_detail;         -- plan structure (this module)
+SELECT * FROM whpg_plan_tree.instrument_detail;  -- live row counters (kernel .so)
 ```
 
-Lives in its own `plan_tree` schema, deliberately not `query_metrics`
-(that schema belongs to the unrelated, pre-existing
-`gp_instrument_shmem_detail`) and deliberately not `gp_`-prefixed (GPDB
-reserves that prefix for system schemas).
+Everything lives under a single `whpg_plan_tree` schema (matches the
+extension name). Deliberately not `gp_`-prefixed (GPDB reserves that
+prefix for system schemas). Two views cover the two halves of "live
+plan tree + row progress" and share the same
+`(tmid, ssid, ccnt, segid, nid)` key, so joining them gives you both
+sides in one query -- see [How it works](#how-it-works).
+
+- `whpg_plan_tree.plan_detail` -- one row per (running query, segment,
+  plan node), backed by this extension's own shmem (filled at query
+  start by `CapturePlanTree`). Columns: `nid`, `parent_nid`,
+  `node_type`, `strategy`, `partial_mode`, `operation`, `relname`,
+  `plan_rows` (estimated), `startup_cost`, `total_cost`, `plan_width`,
+  motion senders/receivers.
+- `whpg_plan_tree.instrument_detail` -- one row per (running query,
+  segment, plan node), backed by the kernel's own per-node row-counter
+  ring (`$libdir/gp_instrument_shmem`, filled whenever
+  `gp_enable_query_metrics` is on). Columns: `tuplecount`, `nloops`,
+  `ntuples` (actual). Thin SQL wrapper over the kernel `.so`; bundled
+  here so one `CREATE EXTENSION` gets both sides of the join without
+  operators having to hand-run a matching DDL. Wrapped in a
+  `DO/EXCEPTION` block so `CREATE EXTENSION` still succeeds on any
+  fork that doesn't ship the kernel library -- the bootstrap is a
+  subtransaction, so on failure nothing new is left behind and
+  `whpg_plan_tree.plan_detail` keeps working on its own.
 
 Consumed by [pg_dash](https://github.com/avamingli/pg_dash)'s "Watch"
 live query plan tree feature (`Capabilities.RealPlanShmem`) -- the

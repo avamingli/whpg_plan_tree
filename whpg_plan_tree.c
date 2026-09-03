@@ -65,18 +65,19 @@
  * cores carry all three despite forking their own planner). Gated the
  * same way, by the real upstream introduction version.
  *
- * Exposed as plan_tree.plan_tree_detail (own schema, deliberately not
- * query_metrics -- that schema already belongs to gp_internal_tools'
- * unrelated gp_instrument_shmem_detail; also deliberately not gp_-prefixed
- * -- GPDB reserves that prefix for system schemas).
+ * Exposed as whpg_plan_tree.plan_detail (own schema, deliberately not
+ * gp_-prefixed -- GPDB reserves that prefix for system schemas). This
+ * extension's own script also creates whpg_plan_tree.instrument_detail,
+ * a thin wrapper over the kernel's $libdir/gp_instrument_shmem so both
+ * sides of "plan structure + row progress" surface under one schema.
  *
  * Captured per node: nid, parent_nid, node type, and the same
  * strategy/partial-mode/operation/motion-type/relname/plan_rows fields
  * EXPLAIN (FORMAT JSON) exposes as separate properties for
  * Agg/SetOp/ModifyTable/ForeignScan/Motion/Scan nodes. A client can build
- * the exact tree gp_instrument_shmem_detail's nid refers to by joining on
- * (tmid, ssid, ccnt, segid, nid) -- no re-EXPLAIN, no client-side
- * renumbering.
+ * the exact tree whpg_plan_tree.instrument_detail's nid refers to by
+ * joining on (tmid, ssid, ccnt, segid, nid) -- no re-EXPLAIN, no
+ * client-side renumbering.
  *
  * Shmem layout and slot lifecycle mirror InstrumentationSlot as closely
  * as possible: same free-list-in-shmem design (PATTERN-filled free slots,
@@ -99,9 +100,10 @@
  *
  * Requires: shared_preload_libraries = 'whpg_plan_tree' (for the hook and
  * shmem) plus CREATE EXTENSION whpg_plan_tree (for the SQL-visible
- * plan_tree_detail() function/view -- same .so either way). This
- * extension is entirely self-contained: it does not depend on, and is not
- * bundled inside, gp_internal_tools.
+ * plan_detail_f_on_master/_on_segments functions and the plan_detail
+ * view -- same .so either way). This extension is entirely
+ * self-contained: it does not depend on, and is not bundled inside,
+ * gp_internal_tools.
  *
  * Portions Copyright (c) 2026, Zhang Mingli (avamingli)
  *
@@ -1038,18 +1040,21 @@ Datum		plan_tree_detail(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(plan_tree_detail);
 
 /*
- * Interface to plan_tree_detail function.
+ * Interface to plan_tree_detail C function. Wrapped from SQL by both
+ * whpg_plan_tree.plan_detail_f_on_master() and _on_segments() -- same
+ * .so entry point, different EXECUTE ON routing:
  *
- * CREATE FUNCTION plan_tree_detail()
- *   RETURNS TABLE ( tmid int4, ssid int4, ccnt int2, segid int2, pid int4
- *   				,nid int2, parent_nid int2, node_type text
- *   				,parallel_aware bool
- *   				,strategy text, partial_mode text, operation text
- *   				,motion_senders int2, motion_receivers int2
- *   				,relname text, plan_rows float8
- *   				,startup_cost float8, total_cost float8, plan_width int4
- *                 )
- *   AS '$libdir/whpg_plan_tree', 'plan_tree_detail' LANGUAGE C VOLATILE;
+ *   CREATE FUNCTION whpg_plan_tree.plan_detail_f_on_master()
+ *     RETURNS TABLE ( tmid int4, ssid int4, ccnt int2, segid int2, pid int4
+ *                    ,nid int2, parent_nid int2, node_type text
+ *                    ,parallel_aware bool
+ *                    ,strategy text, partial_mode text, operation text
+ *                    ,motion_senders int2, motion_receivers int2
+ *                    ,relname text, plan_rows float8
+ *                    ,startup_cost float8, total_cost float8, plan_width int4
+ *                  )
+ *     AS '$libdir/whpg_plan_tree', 'plan_tree_detail'
+ *     LANGUAGE C VOLATILE EXECUTE ON COORDINATOR;
  */
 Datum
 plan_tree_detail(PG_FUNCTION_ARGS)
@@ -1217,8 +1222,9 @@ _PG_init(void)
 	/*
 	 * In order to create our shared memory area, we have to be loaded via
 	 * shared_preload_libraries. If not, fall out without hooking into
-	 * anything -- the plan_tree_detail() SQL function can still be
-	 * created (it just returns nothing, PlanTreeGlobal stays NULL).
+	 * anything -- the plan_detail_f_on_master/_on_segments SQL functions
+	 * can still be created (they just return nothing, PlanTreeGlobal
+	 * stays NULL).
 	 */
 	if (!process_shared_preload_libraries_in_progress)
 		return;

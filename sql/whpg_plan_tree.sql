@@ -14,7 +14,7 @@
 --
 -- Also deliberately does NOT assert cross-row tree-shape invariants (e.g.
 -- "every parent_nid resolves to a captured node") against arbitrary rows
--- in plan_tree_detail: (tmid, ssid, ccnt, segid) is only unique among
+-- in whpg_plan_tree.plan_detail: (tmid, ssid, ccnt, segid) is only unique among
 -- *concurrently live* captures, not forever -- on a long-lived cluster
 -- that has cycled through many sessions, an old, already-fully-recycled
 -- capture's key can coincide with a new one (confirmed live: a
@@ -42,24 +42,24 @@ SELECT sess_id AS own_ssid FROM pg_stat_activity WHERE pid = pg_backend_pid() \g
 CREATE EXTENSION whpg_plan_tree;
 
 -- Object shape: the extension's own script created these.
-\d plan_tree.plan_tree_detail
+\d whpg_plan_tree.plan_detail
 
 -- Precondition check: fail loudly, not silently, if nothing was captured
 -- (most likely cause: gp_enable_query_metrics/shared_preload_libraries not
 -- set on this cluster -- see the precondition note above).
 SELECT count(*) > 0 AS captured_something
-FROM plan_tree.plan_tree_detail
+FROM whpg_plan_tree.plan_detail
 WHERE ssid = :own_ssid
-  AND ccnt = (SELECT min(ccnt) FROM plan_tree.plan_tree_detail WHERE ssid = :own_ssid);
+  AND ccnt = (SELECT min(ccnt) FROM whpg_plan_tree.plan_detail WHERE ssid = :own_ssid);
 
 -- The coordinator's own capture (segid = -1) is written by a single,
 -- uninterrupted walk of its own local plan tree in CapturePlanTree() --
 -- unlike a cross-segid scan, this one slot's own internal consistency
 -- held up reliably across repeated live runs. Exactly one root.
 SELECT count(*) = 1 AS exactly_one_coordinator_root
-FROM plan_tree.plan_tree_detail
+FROM whpg_plan_tree.plan_detail
 WHERE ssid = :own_ssid
-  AND ccnt = (SELECT min(ccnt) FROM plan_tree.plan_tree_detail WHERE ssid = :own_ssid)
+  AND ccnt = (SELECT min(ccnt) FROM whpg_plan_tree.plan_detail WHERE ssid = :own_ssid)
   AND segid = -1
   AND parent_nid = -1;
 
@@ -68,8 +68,8 @@ WHERE ssid = :own_ssid
 -- NodeTag this module doesn't know about -- see the portability comment at
 -- the top of whpg_plan_tree.c for how known gaps are handled).
 SELECT bool_and(node_type IS NOT NULL AND node_type <> '') AS every_node_has_a_label
-FROM plan_tree.plan_tree_detail
+FROM whpg_plan_tree.plan_detail
 WHERE ssid = :own_ssid
-  AND ccnt = (SELECT min(ccnt) FROM plan_tree.plan_tree_detail WHERE ssid = :own_ssid);
+  AND ccnt = (SELECT min(ccnt) FROM whpg_plan_tree.plan_detail WHERE ssid = :own_ssid);
 
 DROP EXTENSION whpg_plan_tree;
