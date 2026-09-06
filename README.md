@@ -6,7 +6,7 @@ the *real*, already-planned plan tree of every running query into shared
 memory and exposes it over SQL as `whpg_plan_tree.plan_detail`. Nothing
 to patch and no core changes on any server: just install this extension.
 
-![A running query's real plan tree rendered live from whpg_plan_tree.plan_detail](img/live_query_plan.png)
+<img src="img/plan-tree.gif" alt="A running query's real plan tree rendered live from whpg_plan_tree.plan_detail: slices light up as they start, per-node row counters climb, the coordinator receives the result" width="720">
 
 *A running query, live: the node labels and tree shape come straight from
 the captured plan (not an `EXPLAIN` reconstruction), joined with the
