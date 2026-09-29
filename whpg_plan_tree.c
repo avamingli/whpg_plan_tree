@@ -1374,7 +1374,7 @@ PG_FUNCTION_INFO_V1(plan_tree_detail);
  * .so entry point, different EXECUTE ON routing:
  *
  *   CREATE FUNCTION whpg_plan_tree.plan_detail_f_on_master()
- *     RETURNS TABLE ( tmid int4, ssid int4, ccnt int2, segid int2, pid int4
+ *     RETURNS TABLE ( tmid int4, ssid int4, ccnt int4, segid int2, pid int4
  *                    ,nid int2, parent_nid int2, node_type text
  *                    ,parallel_aware bool
  *                    ,strategy text, partial_mode text, operation text
@@ -1410,7 +1410,7 @@ plan_tree_detail(PG_FUNCTION_ARGS)
 
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "tmid", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "ssid", INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "ccnt", INT2OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "ccnt", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "segid", INT2OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "pid", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 6, "nid", INT2OID, -1, 0);
@@ -1495,7 +1495,7 @@ plan_tree_detail(PG_FUNCTION_ARGS)
 
 	values[0] = Int32GetDatum(slot->tmid);
 	values[1] = Int32GetDatum(slot->ssid);
-	values[2] = Int16GetDatum(slot->ccnt);
+	values[2] = Int32GetDatum(slot->ccnt);
 	values[3] = Int16GetDatum(slot->segid);
 	values[4] = Int32GetDatum(slot->pid);
 	values[5] = Int16GetDatum(entry->nid);

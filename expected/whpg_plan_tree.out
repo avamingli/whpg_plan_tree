@@ -49,7 +49,7 @@ CREATE EXTENSION whpg_plan_tree;
 ------------------+------------------+-----------+----------+---------
  tmid             | integer          |           |          | 
  ssid             | integer          |           |          | 
- ccnt             | smallint         |           |          | 
+ ccnt             | integer          |           |          | 
  segid            | smallint         |           |          | 
  pid              | integer          |           |          | 
  nid              | smallint         |           |          | 

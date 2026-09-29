@@ -58,7 +58,7 @@ GRANT EXECUTE ON FUNCTION plan_detail_f_on_segments() TO public;
 CREATE VIEW plan_detail AS
 WITH all_entries AS (
   SELECT C.* FROM plan_detail_f_on_master() AS C (
-    tmid int4, ssid int4, ccnt int2, segid int2, pid int4,
+    tmid int4, ssid int4, ccnt int4, segid int2, pid int4,
     nid int2, parent_nid int2, node_type text, parallel_aware bool,
     strategy text, partial_mode text, operation text,
     motion_senders int2, motion_receivers int2,
@@ -67,7 +67,7 @@ WITH all_entries AS (
   )
   UNION ALL
   SELECT C.* FROM plan_detail_f_on_segments() AS C (
-    tmid int4, ssid int4, ccnt int2, segid int2, pid int4,
+    tmid int4, ssid int4, ccnt int4, segid int2, pid int4,
     nid int2, parent_nid int2, node_type text, parallel_aware bool,
     strategy text, partial_mode text, operation text,
     motion_senders int2, motion_receivers int2,
@@ -115,7 +115,26 @@ SET search_path TO DEFAULT;
 --        rather than "error".
 --------------------------------------------------------------------------------
 DO $bootstrap$
+DECLARE
+	ccnt_type text;
 BEGIN
+	-- Real WHPG6/GPDB6's own gp_instrument_shmem kernel module returns
+	-- ccnt as int4 there (confirmed directly against that module's own
+	-- gp_instrument_shmem.c, which documents "ccnt int4" in its own header
+	-- comment); WHPG7/GPDB7 onward returns it as int2 instead -- a real
+	-- kernel-level difference between the two, not a whpg_plan_tree bug.
+	-- RETURNS SETOF record's column-type list has to match whichever the
+	-- live target's kernel actually returns, or a real SELECT against
+	-- instrument_detail fails at runtime with "Returned type integer at
+	-- ordinal position 3, but query expects smallint" -- CREATE VIEW/
+	-- CREATE FUNCTION themselves don't validate this, only a later SELECT
+	-- does, so this stays silent until someone actually queries the view.
+	IF current_setting('server_version_num')::int < 100000 THEN
+		ccnt_type := 'int4';
+	ELSE
+		ccnt_type := 'int2';
+	END IF;
+
 	-- Same MASTER/COORDINATOR fallback as plan_detail_f_on_master() above --
 	-- real WHPG6/GPDB6's grammar has no COORDINATOR keyword at all.
 	BEGIN
@@ -145,20 +164,20 @@ BEGIN
 
 	EXECUTE 'GRANT EXECUTE ON FUNCTION whpg_plan_tree.instrument_detail_f_on_segments() TO public';
 
-	EXECUTE $ddl$
+	EXECUTE format($ddl$
 		CREATE VIEW whpg_plan_tree.instrument_detail AS
 		WITH all_entries AS (
 		  SELECT C.* FROM whpg_plan_tree.instrument_detail_f_on_master() AS C (
-		    tmid int4, ssid int4, ccnt int2, segid int2, pid int4,
+		    tmid int4, ssid int4, ccnt %s, segid int2, pid int4,
 		    nid int2, tuplecount int8, nloops int8, ntuples int8
 		  )
 		  UNION ALL
 		  SELECT C.* FROM whpg_plan_tree.instrument_detail_f_on_segments() AS C (
-		    tmid int4, ssid int4, ccnt int2, segid int2, pid int4,
+		    tmid int4, ssid int4, ccnt %s, segid int2, pid int4,
 		    nid int2, tuplecount int8, nloops int8, ntuples int8
 		  ))
 		SELECT * FROM all_entries ORDER BY segid, nid
-	$ddl$;
+	$ddl$, ccnt_type, ccnt_type);
 
 	EXECUTE 'GRANT SELECT ON whpg_plan_tree.instrument_detail TO public';
 EXCEPTION WHEN OTHERS THEN
