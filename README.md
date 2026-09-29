@@ -141,27 +141,52 @@ external monitor could reliably do before.)
 Built primarily for open-source
 [WarehousePG](https://github.com/warehouse-pg/warehouse-pg); also
 verified live, unmodified, across all GPDB-variant databases, spanning
-PG kernel versions 12 through 20, from one shared source file guarded
-by `#if PG_VERSION_NUM`:
+WHPG6/GPDB6 (real PG9.4-based, verified against a genuine
+`origin/WHPG_6X_STABLE` build, not a version-string guess -- see below)
+through PG20, from one shared source file guarded by `#if PG_VERSION_NUM`:
 
 | PG core era | Shared-memory registration |
 |---|---|
-| < PG15 | direct `RequestAddinShmemSpace()`/`RequestNamedLWLockTranche()` in `_PG_init()` -- no `shmem_request_hook` exists yet |
+| < PG15 (incl. WHPG6/GPDB6) | direct `RequestAddinShmemSpace()` in `_PG_init()` -- no `shmem_request_hook` exists yet |
 | PG15 through PG18 | classic `shmem_request_hook`/`shmem_startup_hook` chaining |
 | PG19 and PG20 | `RegisterShmemCallbacks()`/`ShmemRequestStruct()` |
 
+Within the `< PG15` era, WHPG6/GPDB6 needs its own LWLock-registration
+sub-branch (`WHPG_PLAN_TREE_OLD_GPDB6` in the source): it predates even
+*named* LWLock tranches, so it uses the older `RequestAddinLWLocks()`/
+`LWLockAssign()` API instead of `RequestNamedLWLockTranche()`/
+`GetNamedLWLockTranche()`. It also lacks `AggSplit` (so `partial_mode`
+stays `NULL` there, matching what its own `EXPLAIN` shows -- it never
+prints a "Partial Mode" property either), `Plan.parallel_aware`,
+`planstate_tree_walker()` (hand-walked instead, mirroring `explain.c`'s
+own `ExplainNode()` child-list logic), `exec_rt_fetch()` (uses the older
+`rt_fetch()` macro), and `gp_gettmid()` (the real symbol there is
+`gpmon_gettmid()`). Its `MotionType` enum only has
+`HASH`/`FIXED`/`EXPLICIT` (no separate Gather/GatherSingle/Broadcast
+members), so those get resolved at capture time from
+`Motion.isBroadcast` and the child plan's `Flow.locustype`, exactly like
+its own `explain.c` does. The install script also falls back from
+`EXECUTE ON COORDINATOR` to the older `EXECUTE ON MASTER` keyword there
+(real WHPG6/GPDB6's grammar has no `COORDINATOR` keyword at all).
+
 `query_info_collect_hook` itself -- the hook this module rides on -- is
 byte-identical (typedef, enum values, header location) across every
-supported target. A smaller seam:
+supported target, WHPG6/GPDB6 included. A smaller seam:
 `T_IncrementalSort`/`T_Memoize`/`T_TidRangeScan` don't exist as
-`NodeTag`s on PG12-era targets (PG12 predates all three upstream);
-gated by the real upstream introduction version, not assumed from a
-version number that isn't always representative of NodeTag coverage on
-a GPDB-variant fork -- confirmed directly against each target's own
-headers. Every one of the 58 `NodeTag`s this module's label switches
-reference has been individually checked against each target's
-`nodes.h`/`nodetags.h` -- those three are the *only* gaps found
-anywhere; nothing else is missing on any target.
+`NodeTag`s on PG12-era targets (PG12 predates all three upstream), and a
+further ten (`T_ProjectSet`, `T_SampleScan`, `T_Gather`, `T_GatherMerge`,
+`T_DynamicIndexOnlyScan`, `T_TableFuncScan`, `T_NamedTuplestoreScan`,
+`T_DynamicForeignScan`, `T_CustomScan`, `T_TupleSplit`) additionally
+don't exist on real WHPG6/GPDB6 -- all gated by the real upstream/fork
+introduction point, not assumed from a version number that isn't always
+representative of NodeTag coverage on a GPDB-variant fork (GPDB-lineage
+forks routinely backport upstream commits piecemeal without bumping
+their own self-reported version -- a matching version number is never
+sufficient evidence of API shape on its own; verify headers directly).
+Every `NodeTag` this module's label switches reference has been
+individually checked against each target's `nodes.h`/`nodetags.h` --
+those are the *only* gaps found anywhere; nothing else is missing on any
+target.
 
 ## Testing
 

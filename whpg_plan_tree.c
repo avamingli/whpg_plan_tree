@@ -5,7 +5,9 @@
  *    per query per backend, and expose it over SQL -- entirely as a
  *    loadable module, zero core changes required on any target -- built
  *    primarily for WHPG, also runs unmodified across GPDB-lineage cores
- *    spanning PG12 through PG19.
+ *    spanning WHPG6/GPDB6 (real PG9.4-based, verified against a genuine
+ *    origin/WHPG_6X_STABLE build -- see WHPG_PLAN_TREE_OLD_GPDB6 below)
+ *    through PG19.
  *
  * WHY: gp_enable_query_metrics already ships a shared-memory ring of live
  * per-node row counters (InstrumentationSlot, src/backend/executor/
@@ -29,16 +31,17 @@
  * location) across all three target trees.
  *
  * PORTABILITY: the one part of this module that genuinely differs across
- * PG cores from PG12 through PG19 is how an extension requests and
+ * PG cores from WHPG6/GPDB6 through PG19 is how an extension requests and
  * attaches its own shared memory -- three real eras of core API,
  * confirmed by reading each target's own storage/ipc.h and storage/
  * lwlock.h rather than assumed from version numbers:
  *
- *   PG_VERSION_NUM < 150000 (WHPG7/GPDB7, PG12):
+ *   PG_VERSION_NUM < 150000 (WHPG6/GPDB6 PG9.4-based, WHPG7/GPDB7 PG12):
  *     no shmem_request_hook exists yet (added upstream in PG15) --
- *     RequestAddinShmemSpace()/RequestNamedLWLockTranche() are called
- *     directly inside _PG_init() instead, exactly like contrib/
- *     pg_stat_statements does on this same tree.
+ *     RequestAddinShmemSpace() is called directly inside _PG_init()
+ *     instead, exactly like contrib/pg_stat_statements does on this same
+ *     tree. Within this era, WHPG6 needs its own LWLock-registration
+ *     sub-branch -- see WHPG_PLAN_TREE_OLD_GPDB6 immediately below.
  *   150000 <= PG_VERSION_NUM < 190000 (a later GPDB-lineage core, PG16):
  *     classic shmem_request_hook/shmem_startup_hook chaining, again
  *     mirroring pg_stat_statements on this tree.
@@ -56,14 +59,53 @@
  * via that era's also-new one-arg LWLockNewTrancheId(). See
  * WHPG_PLAN_TREE_NEW_CALLBACKS below.
  *
- * A second, smaller portability seam: three NodeTags this module's label
- * switch needs (T_IncrementalSort, T_Memoize, T_TidRangeScan) don't exist
- * at all on WHPG7/GPDB7 (PG12 predates all three upstream: PG13, PG14 and
- * PG14 respectively) -- confirmed by grepping nodes.h directly rather than
- * assumed from the PG12 version number alone, since NodeTag coverage on a
- * GPDB-lineage fork isn't guaranteed to track upstream 1:1 (some later
- * cores carry all three despite forking their own planner). Gated the
- * same way, by the real upstream introduction version.
+ * WHPG6/GPDB6 -- confirmed against a genuine origin/WHPG_6X_STABLE build,
+ * not inferred from PG_VERSION_NUM alone (GPDB-lineage forks routinely
+ * backport upstream commits piecemeal without bumping their own
+ * self-reported version, so a matching version number is not sufficient
+ * evidence of API shape -- verify headers directly) -- predates even
+ * *named* LWLock tranches (added upstream around 9.6/10): no
+ * RequestNamedLWLockTranche()/GetNamedLWLockTranche() at all. It uses the
+ * older fixed-pool RequestAddinLWLocks(n)+LWLockAssign() API instead,
+ * exactly like contrib/pg_stat_statements does on that same tree --
+ * gated by WHPG_PLAN_TREE_OLD_GPDB6 (PG_VERSION_NUM < 100000, safely
+ * separating it from every other supported era, none of which fall
+ * between 9.4 and 12). The same real-WHPG6 build also lacks: AggSplit
+ * (Agg instead has plain combineStates/finalizeAggs bools, and EXPLAIN
+ * there never prints a "Partial Mode" property at all, so this module
+ * leaves partial_mode NULL on that era rather than inventing one -- see
+ * fill_node_extras()); Plan.parallel_aware (always reported as false);
+ * ForeignScan.operation (writable FDW postdates it; the operation label
+ * is always NULL there); planstate_tree_walker() (added well after PG9.4
+ * -- capture_walk_children_gpdb6() below hand-walks the same child links
+ * explain.c's own ExplainNode() uses on that tree: outerPlanState/
+ * innerPlanState plus the per-NodeTag special cases for ModifyTable/
+ * Append/MergeAppend/Sequence/BitmapAnd/BitmapOr/SubqueryScan, plus
+ * initPlan/subPlan); exec_rt_fetch() (use the older rt_fetch() macro over
+ * es_range_table instead); and gp_gettmid() (use gpmon_gettmid() from
+ * gpmon/gpmon.h instead, confirmed as the real symbol name on that tree).
+ * Its MotionType enum also only has HASH/FIXED/EXPLICIT (no separate
+ * Gather/GatherSingle/Broadcast members -- those are all MOTIONTYPE_FIXED
+ * there, disambiguated at runtime via Motion.isBroadcast and the child
+ * plan's Flow.locustype, mirroring explain.c's own T_Motion case exactly);
+ * fill_node_extras() normalizes that down to the same 0..4 category
+ * codes newer eras get straight from their richer enum, so
+ * MotionTypeName() still needs its own old-era switch (using integer
+ * literals, since the newer eras' named constants for those categories
+ * don't exist as identifiers on real WHPG6 at all) but no wider change.
+ *
+ * A second, smaller portability seam: several NodeTags this module's
+ * label switch needs don't exist on one era or another -- confirmed by
+ * grepping each target's own nodes.h directly rather than assumed from a
+ * version number alone, since NodeTag coverage on a GPDB-lineage fork
+ * isn't guaranteed to track upstream 1:1. T_IncrementalSort/T_Memoize/
+ * T_TidRangeScan don't exist on WHPG7/GPDB7 (PG12 predates all three
+ * upstream: PG13, PG14 and PG14 respectively), gated by the real upstream
+ * introduction version. A further ten -- T_ProjectSet, T_SampleScan,
+ * T_Gather, T_GatherMerge, T_DynamicIndexOnlyScan, T_TableFuncScan,
+ * T_NamedTuplestoreScan, T_DynamicForeignScan, T_CustomScan, T_TupleSplit
+ * -- additionally don't exist on real WHPG6/GPDB6, gated by
+ * WHPG_PLAN_TREE_OLD_GPDB6 since WHPG7/GPDB7 onward carries all ten.
  *
  * Exposed as whpg_plan_tree.plan_detail (own schema, deliberately not
  * gp_-prefixed -- GPDB reserves that prefix for system schemas). This
@@ -141,6 +183,24 @@ PG_MODULE_MAGIC;
 #define WHPG_PLAN_TREE_NEW_CALLBACKS 1
 #else
 #define WHPG_PLAN_TREE_NEW_CALLBACKS 0
+#endif
+
+/*
+ * See the PORTABILITY section of the file header comment for the full list
+ * of API gaps this gates. 100000 (PG10) safely separates real WHPG6/GPDB6
+ * (genuinely PG9.4-based) from every other supported era (WHPG7/GPDB7
+ * onward is PG12+) -- nothing this module targets falls in between.
+ */
+#if PG_VERSION_NUM < 100000
+#define WHPG_PLAN_TREE_OLD_GPDB6 1
+#else
+#define WHPG_PLAN_TREE_OLD_GPDB6 0
+#endif
+
+#if WHPG_PLAN_TREE_OLD_GPDB6
+#include "cdb/cdbpathlocus.h"	/* CdbLocusType_Replicated, for T_Motion labeling */
+#include "gpmon/gpmon.h"		/* gpmon_gettmid() -- real symbol name on this era */
+#include "parser/parsetree.h"	/* rt_fetch() -- exec_rt_fetch() postdates this era */
 #endif
 
 /*
@@ -303,7 +363,11 @@ static query_info_collect_hook_type prev_query_info_collect_hook = NULL;
 
 static void planTreeRecycleCallback(ResourceReleasePhase phase, bool isCommit,
 									  bool isTopLevel, void *arg);
+#if WHPG_PLAN_TREE_OLD_GPDB6
+static void capture_walk_children_gpdb6(PlanState *planstate, PlanCaptureContext *ctx);
+#else
 static bool plan_capture_walker(PlanState *planstate, void *context);
+#endif
 static void capture_one_node(PlanState *planstate, PlanCaptureContext *ctx);
 static void CapturePlanTree(QueryDesc *queryDesc);
 static void plan_tree_query_info_hook(QueryMetricsStatus status, void *args);
@@ -465,7 +529,11 @@ PlanTreeRequest(void)
 		return;
 
 	RequestAddinShmemSpace(size);
+#if WHPG_PLAN_TREE_OLD_GPDB6
+	RequestAddinLWLocks(1);		/* real WHPG6/GPDB6 predates named tranches */
+#else
 	RequestNamedLWLockTranche("whpg_plan_tree", 1);
+#endif
 }
 
 /*
@@ -500,7 +568,11 @@ PlanTreeStartup(void)
 		 * setting `lock` first would just get clobbered by the memset.
 		 */
 		PlanTreeBuildFreeList();
+#if WHPG_PLAN_TREE_OLD_GPDB6
+		PlanTreeGlobal->lock = LWLockAssign();		/* real WHPG6/GPDB6 predates named tranches */
+#else
 		PlanTreeGlobal->lock = &(GetNamedLWLockTranche("whpg_plan_tree"))->lock;
+#endif
 	}
 
 	LWLockRelease(AddinShmemInitLock);
@@ -526,6 +598,9 @@ PlanTreeStartup(void)
  * upstream introduction versions (PG13/PG14/PG14) rather than assumed
  * present -- WHPG7/GPDB7 (PG12) predates all three and doesn't have the
  * NodeTag at all, confirmed directly against nodes.h rather than inferred.
+ * A further ten are gated on WHPG_PLAN_TREE_OLD_GPDB6 -- absent on real
+ * WHPG6/GPDB6, present from WHPG7/GPDB7 onward; see the file header
+ * comment's PORTABILITY section.
  */
 static const char *
 PlanTreeNodeTypeName(NodeTag tag)
@@ -533,7 +608,9 @@ PlanTreeNodeTypeName(NodeTag tag)
 	switch (tag)
 	{
 		case T_Result: return "Result";
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_ProjectSet: return "ProjectSet";
+#endif
 		case T_ModifyTable: return "ModifyTable";
 		case T_Append: return "Append";
 		case T_MergeAppend: return "Merge Append";
@@ -546,12 +623,16 @@ PlanTreeNodeTypeName(NodeTag tag)
 		case T_HashJoin: return "Hash Join";
 		case T_SeqScan: return "Seq Scan";
 		case T_DynamicSeqScan: return "Dynamic Seq Scan";
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_SampleScan: return "Sample Scan";
 		case T_Gather: return "Gather";
 		case T_GatherMerge: return "Gather Merge";
+#endif
 		case T_IndexScan: return "Index Scan";
 		case T_DynamicIndexScan: return "Dynamic Index Scan";
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_DynamicIndexOnlyScan: return "Dynamic Index Only Scan";
+#endif
 		case T_IndexOnlyScan: return "Index Only Scan";
 		case T_BitmapIndexScan: return "Bitmap Index Scan";
 		case T_DynamicBitmapIndexScan: return "Dynamic Bitmap Index Scan";
@@ -563,16 +644,22 @@ PlanTreeNodeTypeName(NodeTag tag)
 #endif
 		case T_SubqueryScan: return "Subquery Scan";
 		case T_FunctionScan: return "Function Scan";
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_TableFuncScan: return "Table Function Scan";
+#endif
 		case T_TableFunctionScan: return "Table Function Scan"; /* GPDB: distinct NodeTag from T_TableFuncScan, same explain.c label */
 		case T_ValuesScan: return "Values Scan";
 		case T_CteScan: return "CTE Scan";
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_NamedTuplestoreScan: return "Named Tuplestore Scan";
+#endif
 		case T_WorkTableScan: return "WorkTable Scan";
 		case T_ShareInputScan: return "Shared Scan";
 		case T_ForeignScan: return "Foreign Scan";
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_DynamicForeignScan: return "Dynamic Foreign Scan";
 		case T_CustomScan: return "Custom Scan";
+#endif
 		case T_Material: return "Materialize";
 #if PG_VERSION_NUM >= 170000
 		case T_Memoize: return "Memoize";
@@ -581,7 +668,9 @@ PlanTreeNodeTypeName(NodeTag tag)
 #if PG_VERSION_NUM >= 130000
 		case T_IncrementalSort: return "Incremental Sort";
 #endif
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_TupleSplit: return "TupleSplit";
+#endif
 		case T_Agg: return "Aggregate";
 		case T_WindowAgg: return "WindowAgg";
 		case T_Unique: return "Unique";
@@ -602,10 +691,29 @@ PlanTreeNodeTypeName(NodeTag tag)
  * every other node kind PlanTreeNodeTypeName() covers with a plain
  * NodeTag switch -- mirrors explain.c's own T_Motion case
  * (src/backend/commands/explain.c) exactly, string for string.
+ *
+ * entry->motion_type is always one of the same 0..4 category codes
+ * regardless of era (see fill_node_extras()'s T_Motion case) -- on real
+ * WHPG6/GPDB6 the underlying MotionType enum only has HASH/FIXED/EXPLICIT
+ * (no separate named constants for the Gather/GatherSingle/Broadcast
+ * categories at all, so the newer eras' switch below can't even compile
+ * there), so this needs its own old-era switch using plain integer
+ * literals for the categories fill_node_extras() already resolved.
  */
 static const char *
 MotionTypeName(int16 motion_type)
 {
+#if WHPG_PLAN_TREE_OLD_GPDB6
+	switch (motion_type)
+	{
+		case 0: return "Gather Motion";
+		case 1: return "Explicit Gather Motion";
+		case 2: return "Redistribute Motion";
+		case 3: return "Broadcast Motion";
+		case 4: return "Explicit Redistribute Motion";
+		default: return "???";
+	}
+#else
 	switch ((MotionType) motion_type)
 	{
 		case MOTIONTYPE_GATHER: return "Gather Motion";
@@ -618,6 +726,7 @@ MotionTypeName(int16 motion_type)
 								 * behind its own feature flag): same
 								 * fallback explain.c uses */
 	}
+#endif
 }
 
 /*
@@ -649,14 +758,23 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 					case AGG_PLAIN: strlcpy(entry->strategy, "Plain", sizeof(entry->strategy)); break;
 					case AGG_SORTED: strlcpy(entry->strategy, "Sorted", sizeof(entry->strategy)); break;
 					case AGG_HASHED: strlcpy(entry->strategy, "Hashed", sizeof(entry->strategy)); break;
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 					case AGG_MIXED: strlcpy(entry->strategy, "Mixed", sizeof(entry->strategy)); break;
+#endif
 				}
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 				if (DO_AGGSPLIT_SKIPFINAL(agg->aggsplit))
 					strlcpy(entry->partial_mode, "Partial", sizeof(entry->partial_mode));
 				else if (DO_AGGSPLIT_COMBINE(agg->aggsplit))
 					strlcpy(entry->partial_mode, "Finalize", sizeof(entry->partial_mode));
 				else
 					strlcpy(entry->partial_mode, "Simple", sizeof(entry->partial_mode));
+#endif
+				/* Real WHPG6/GPDB6 has no AggSplit at all (Agg instead has
+				 * plain combineStates/finalizeAggs bools), and its EXPLAIN
+				 * never prints a "Partial Mode" property for Agg either --
+				 * leave partial_mode NULL there rather than inventing a
+				 * label EXPLAIN itself wouldn't show. */
 				break;
 			}
 		case T_SetOp:
@@ -681,6 +799,7 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 				}
 				break;
 			}
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_ForeignScan:
 		case T_DynamicForeignScan:
 			{
@@ -696,6 +815,13 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 				}
 				break;
 			}
+#endif
+			/* Real WHPG6/GPDB6's ForeignScan predates writable FDWs and has
+			 * no operation field at all (and EXPLAIN there never prints one
+			 * either) -- fall through to the default case, leaving
+			 * entry->operation NULL, rather than gating just the field
+			 * access; T_ForeignScan itself is still a valid NodeTag there,
+			 * just with nothing extra to report. */
 		case T_Motion:
 			{
 				Motion	   *motion = (Motion *) plan;
@@ -708,7 +834,38 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 				 * back to what it already derives from EXPLAIN for the
 				 * Motion N:M annotation.
 				 */
+#if WHPG_PLAN_TREE_OLD_GPDB6
+				/*
+				 * Real WHPG6/GPDB6's MotionType enum only has
+				 * HASH/FIXED/EXPLICIT -- FIXED covers both Gather and
+				 * Broadcast, disambiguated at runtime via isBroadcast and
+				 * the child plan's Flow.locustype. Normalize down to the
+				 * same 0..4 category codes MotionTypeName() expects on
+				 * every era, mirroring explain.c's own T_Motion case
+				 * exactly (see the file header comment).
+				 */
+				switch (motion->motionType)
+				{
+					case MOTIONTYPE_HASH:
+						entry->motion_type = 2;		/* Redistribute Motion */
+						break;
+					case MOTIONTYPE_EXPLICIT:
+						entry->motion_type = 4;		/* Explicit Redistribute Motion */
+						break;
+					case MOTIONTYPE_FIXED:
+					default:
+						if (motion->isBroadcast)
+							entry->motion_type = 3;		/* Broadcast Motion */
+						else if (plan->lefttree && plan->lefttree->flow &&
+								 plan->lefttree->flow->locustype == CdbLocusType_Replicated)
+							entry->motion_type = 1;		/* Explicit Gather Motion */
+						else
+							entry->motion_type = 0;		/* Gather Motion */
+						break;
+				}
+#else
 				entry->motion_type = (int16) motion->motionType;
+#endif
 				break;
 			}
 		default:
@@ -720,11 +877,15 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 	{
 		case T_SeqScan:
 		case T_DynamicSeqScan:
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_SampleScan:
+#endif
 		case T_IndexScan:
 		case T_DynamicIndexScan:
 		case T_IndexOnlyScan:
+#if !WHPG_PLAN_TREE_OLD_GPDB6
 		case T_DynamicIndexOnlyScan:
+#endif
 		case T_BitmapHeapScan:
 		case T_DynamicBitmapHeapScan:
 		case T_TidScan:
@@ -737,8 +898,15 @@ fill_node_extras(PlanState *planstate, PlanTreeNodeEntry *entry)
 				 * struct member (see plannodes.h), so the cast is safe.
 				 */
 				Scan	   *scan = (Scan *) plan;
+#if WHPG_PLAN_TREE_OLD_GPDB6
+				/* exec_rt_fetch() postdates real WHPG6/GPDB6; use the
+				 * older rt_fetch() macro directly over es_range_table. */
+				RangeTblEntry *rte = rt_fetch(scan->scanrelid,
+											   planstate->state->es_range_table);
+#else
 				RangeTblEntry *rte = exec_rt_fetch(scan->scanrelid,
 													planstate->state);
+#endif
 				char	   *relname = OidIsValid(rte->relid) ?
 					get_rel_name(rte->relid) : NULL;
 
@@ -772,7 +940,11 @@ capture_one_node(PlanState *planstate, PlanCaptureContext *ctx)
 	entry->nid = my_nid;
 	entry->parent_nid = ctx->parent_nid;
 	entry->node_type = nodeTag(plan);
+#if WHPG_PLAN_TREE_OLD_GPDB6
+	entry->parallel_aware = false;		/* real WHPG6/GPDB6's Plan has no such field */
+#else
 	entry->parallel_aware = plan->parallel_aware;
+#endif
 	entry->plan_rows = plan->plan_rows;
 	entry->startup_cost = plan->startup_cost;
 	entry->total_cost = plan->total_cost;
@@ -781,16 +953,126 @@ capture_one_node(PlanState *planstate, PlanCaptureContext *ctx)
 
 	saved_parent = ctx->parent_nid;
 	ctx->parent_nid = my_nid;
+#if WHPG_PLAN_TREE_OLD_GPDB6
+	capture_walk_children_gpdb6(planstate, ctx);
+#else
 	planstate_tree_walker(planstate, plan_capture_walker, ctx);
+#endif
 	ctx->parent_nid = saved_parent;
 }
 
+#if WHPG_PLAN_TREE_OLD_GPDB6
+/*
+ * Real WHPG6/GPDB6 predates planstate_tree_walker() -- hand-walk the same
+ * child links explain.c's own ExplainNode() uses on that tree instead:
+ * outerPlanState/innerPlanState (covers the overwhelming majority of node
+ * kinds -- joins, Agg, Sort, Limit, single-child scans, ...) plus the
+ * per-NodeTag special cases for the handful of node kinds that fan out to
+ * more than two children, plus initPlan/subPlan. See the file header
+ * comment's PORTABILITY section.
+ */
+static void
+capture_walk_children_gpdb6(PlanState *planstate, PlanCaptureContext *ctx)
+{
+	Plan	   *plan = planstate->plan;
+	ListCell   *lc;
+
+	if (outerPlanState(planstate))
+		capture_one_node(outerPlanState(planstate), ctx);
+	if (innerPlanState(planstate))
+		capture_one_node(innerPlanState(planstate), ctx);
+
+	switch (nodeTag(plan))
+	{
+		case T_ModifyTable:
+			{
+				ModifyTableState *mts = (ModifyTableState *) planstate;
+				int			i;
+
+				for (i = 0; i < mts->mt_nplans; i++)
+					capture_one_node(mts->mt_plans[i], ctx);
+				break;
+			}
+		case T_Append:
+			{
+				AppendState *as = (AppendState *) planstate;
+				int			i;
+
+				for (i = 0; i < as->as_nplans; i++)
+					capture_one_node(as->appendplans[i], ctx);
+				break;
+			}
+		case T_MergeAppend:
+			{
+				MergeAppendState *ms = (MergeAppendState *) planstate;
+				int			i;
+
+				for (i = 0; i < ms->ms_nplans; i++)
+					capture_one_node(ms->mergeplans[i], ctx);
+				break;
+			}
+		case T_Sequence:
+			{
+				SequenceState *ss = (SequenceState *) planstate;
+				int			i;
+
+				for (i = 0; i < ss->numSubplans; i++)
+					capture_one_node(ss->subplans[i], ctx);
+				break;
+			}
+		case T_BitmapAnd:
+			{
+				BitmapAndState *bs = (BitmapAndState *) planstate;
+				int			i;
+
+				for (i = 0; i < bs->nplans; i++)
+					capture_one_node(bs->bitmapplans[i], ctx);
+				break;
+			}
+		case T_BitmapOr:
+			{
+				BitmapOrState *bs = (BitmapOrState *) planstate;
+				int			i;
+
+				for (i = 0; i < bs->nplans; i++)
+					capture_one_node(bs->bitmapplans[i], ctx);
+				break;
+			}
+		case T_SubqueryScan:
+			{
+				SubqueryScanState *sqs = (SubqueryScanState *) planstate;
+
+				if (sqs->subplan)
+					capture_one_node(sqs->subplan, ctx);
+				break;
+			}
+		default:
+			break;
+	}
+
+	foreach(lc, planstate->initPlan)
+	{
+		SubPlanState *sps = (SubPlanState *) lfirst(lc);
+
+		if (sps->planstate)
+			capture_one_node(sps->planstate, ctx);
+	}
+	foreach(lc, planstate->subPlan)
+	{
+		SubPlanState *sps = (SubPlanState *) lfirst(lc);
+
+		if (sps->planstate)
+			capture_one_node(sps->planstate, ctx);
+	}
+}
+#else
 static bool
 plan_capture_walker(PlanState *planstate, void *context)
 {
 	capture_one_node(planstate, (PlanCaptureContext *) context);
 	return false;				/* keep walking the whole tree */
 }
+#endif
 
 /*
  * Pick a free slot, walk queryDesc->planstate once, and populate it with
@@ -905,7 +1187,11 @@ CapturePlanTree(QueryDesc *queryDesc)
 	 */
 	slot->segid = (int16) GpIdentity.segindex;
 	slot->pid = MyProcPid;
+#if WHPG_PLAN_TREE_OLD_GPDB6
+	gpmon_gettmid(&(slot->tmid));	/* real symbol name on this era */
+#else
 	gp_gettmid(&(slot->tmid));
+#endif
 	slot->ssid = gp_session_id;
 	slot->ccnt = gp_command_count;
 	slot->nnodes = 0;
@@ -1113,7 +1399,14 @@ plan_tree_detail(PG_FUNCTION_ARGS)
 
 		MemoryContext oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
+#if WHPG_PLAN_TREE_OLD_GPDB6
+		/* Real WHPG6/GPDB6 predates the removal of tuple OIDs; the extra
+		 * hasoid arg postdates it (both eras this file otherwise targets
+		 * already dropped it -- see the file header comment). */
+		TupleDesc	tupdesc = CreateTemplateTupleDesc(WHPG_PLAN_TREE_DETAIL_NATTR, false);
+#else
 		TupleDesc	tupdesc = CreateTemplateTupleDesc(WHPG_PLAN_TREE_DETAIL_NATTR);
+#endif
 
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "tmid", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "ssid", INT4OID, -1, 0);

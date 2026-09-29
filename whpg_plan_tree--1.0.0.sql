@@ -21,10 +21,30 @@ SET search_path = whpg_plan_tree;
 --        re-running EXPLAIN or re-deriving plan_node_id numbering.
 --------------------------------------------------------------------------------
 
-CREATE FUNCTION plan_detail_f_on_master()
-RETURNS SETOF record
-AS '$libdir/whpg_plan_tree', 'plan_tree_detail'
-LANGUAGE C VOLATILE EXECUTE ON COORDINATOR;
+-- Real WHPG6/GPDB6 predates the MASTER->COORDINATOR rename -- its grammar
+-- only accepts EXECUTE ON MASTER (confirmed against a genuine
+-- origin/WHPG_6X_STABLE build's gram.y, which has no COORDINATOR keyword
+-- at all). Try the current spelling first and fall back to the old one on
+-- a syntax error, rather than forking this whole script by target version.
+DO $bootstrap_plan_detail$
+BEGIN
+	BEGIN
+		EXECUTE $ddl$
+			CREATE FUNCTION plan_detail_f_on_master()
+			RETURNS SETOF record
+			AS '$libdir/whpg_plan_tree', 'plan_tree_detail'
+			LANGUAGE C VOLATILE EXECUTE ON COORDINATOR
+		$ddl$;
+	EXCEPTION WHEN syntax_error THEN
+		EXECUTE $ddl$
+			CREATE FUNCTION plan_detail_f_on_master()
+			RETURNS SETOF record
+			AS '$libdir/whpg_plan_tree', 'plan_tree_detail'
+			LANGUAGE C VOLATILE EXECUTE ON MASTER
+		$ddl$;
+	END;
+END
+$bootstrap_plan_detail$;
 
 GRANT EXECUTE ON FUNCTION plan_detail_f_on_master() TO public;
 
@@ -96,12 +116,23 @@ SET search_path TO DEFAULT;
 --------------------------------------------------------------------------------
 DO $bootstrap$
 BEGIN
-	EXECUTE $ddl$
-		CREATE FUNCTION whpg_plan_tree.instrument_detail_f_on_master()
-		RETURNS SETOF record
-		AS '$libdir/gp_instrument_shmem', 'gp_instrument_shmem_detail'
-		LANGUAGE C VOLATILE EXECUTE ON COORDINATOR
-	$ddl$;
+	-- Same MASTER/COORDINATOR fallback as plan_detail_f_on_master() above --
+	-- real WHPG6/GPDB6's grammar has no COORDINATOR keyword at all.
+	BEGIN
+		EXECUTE $ddl$
+			CREATE FUNCTION whpg_plan_tree.instrument_detail_f_on_master()
+			RETURNS SETOF record
+			AS '$libdir/gp_instrument_shmem', 'gp_instrument_shmem_detail'
+			LANGUAGE C VOLATILE EXECUTE ON COORDINATOR
+		$ddl$;
+	EXCEPTION WHEN syntax_error THEN
+		EXECUTE $ddl$
+			CREATE FUNCTION whpg_plan_tree.instrument_detail_f_on_master()
+			RETURNS SETOF record
+			AS '$libdir/gp_instrument_shmem', 'gp_instrument_shmem_detail'
+			LANGUAGE C VOLATILE EXECUTE ON MASTER
+		$ddl$;
+	END;
 
 	EXECUTE 'GRANT EXECUTE ON FUNCTION whpg_plan_tree.instrument_detail_f_on_master() TO public';
 
